@@ -506,6 +506,53 @@ impl Client {
         self.current_url_().await
     }
 
+    /// Retrieve cookies for the currently active URL
+    pub async fn cookies(&mut self) -> Result<cookie::CookieJar, error::CmdError> {
+        let cookies = self.issue(WebDriverCommand::GetCookies).await?;
+        if !cookies.is_array() {
+            return Err(error::CmdError::NotW3C(cookies));
+        }
+
+        // now add all the cookies
+        let mut all_ok = true;
+        let mut jar = cookie::CookieJar::new();
+        for cookie in cookies.as_array().unwrap() {
+            if !cookie.is_object() {
+                all_ok = false;
+                break;
+            }
+
+            // https://w3c.github.io/webdriver/webdriver-spec.html#cookies
+            let cookie = cookie.as_object().unwrap();
+            if !cookie.contains_key("name") || !cookie.contains_key("value") {
+                all_ok = false;
+                break;
+            }
+
+            if !cookie["name"].is_string() || !cookie["value"].is_string() {
+                all_ok = false;
+                break;
+            }
+
+            // Note that since we're sending these cookies, all that matters is the mapping
+            // from name to value. The other fields only matter when deciding whether to
+            // include a cookie or not, and the driver has already decided that for us
+            // (GetCookies is for a particular URL).
+            jar.add_original(
+                cookie::Cookie::new(
+                    cookie["name"].as_str().unwrap().to_owned(),
+                    cookie["value"].as_str().unwrap().to_owned(),
+                )
+            );
+        }
+
+        if !all_ok {
+            Err(error::CmdError::NotW3C(cookies))
+        } else {
+            Ok(jar)
+        }
+    }
+
     /// Get a PNG-encoded screenshot of the current page.
     pub async fn screenshot(&mut self) -> Result<Vec<u8>, error::CmdError> {
         let src = self.issue(WebDriverCommand::TakeScreenshot).await?;
@@ -605,58 +652,29 @@ impl Client {
         let cookie_url = url.clone().join("/please_give_me_your_cookies")?;
         self.goto(cookie_url.as_str()).await?;
 
-        // TODO: go back before we return if this call errors:
-        let cookies = self.issue(WebDriverCommand::GetCookies).await?;
-        if !cookies.is_array() {
-            return Err(error::CmdError::NotW3C(cookies));
-        }
-        self.back().await?;
+        let cookies = {
+            let res = self.cookies().await;
+            self.back().await?;
+            res?
+        };
         let ua = self.get_ua().await?;
 
-        // now add all the cookies
-        let mut all_ok = true;
-        let mut jar = Vec::new();
-        for cookie in cookies.as_array().unwrap() {
-            if !cookie.is_object() {
-                all_ok = false;
-                break;
+        let mut jar = String::new();
+        let mut cookies = cookies.iter();
+        if let Some(cookie) = cookies.next() {
+            use std::fmt::Write;
+
+            write!(jar, "{}", cookie).expect("unexpected Display error");
+            for cookie in cookies {
+                write!(jar, "; {}", cookie).expect("unexpected Display error");
             }
-
-            // https://w3c.github.io/webdriver/webdriver-spec.html#cookies
-            let cookie = cookie.as_object().unwrap();
-            if !cookie.contains_key("name") || !cookie.contains_key("value") {
-                all_ok = false;
-                break;
-            }
-
-            if !cookie["name"].is_string() || !cookie["value"].is_string() {
-                all_ok = false;
-                break;
-            }
-
-            // Note that since we're sending these cookies, all that matters is the mapping
-            // from name to value. The other fields only matter when deciding whether to
-            // include a cookie or not, and the driver has already decided that for us
-            // (GetCookies is for a particular URL).
-            jar.push(
-                cookie::Cookie::new(
-                    cookie["name"].as_str().unwrap().to_owned(),
-                    cookie["value"].as_str().unwrap().to_owned(),
-                )
-                .encoded()
-                .to_string(),
-            );
-        }
-
-        if !all_ok {
-            return Err(error::CmdError::NotW3C(cookies));
         }
 
         let mut req = hyper::Request::builder();
         req = req
             .method(method)
             .uri(http::Uri::try_from(url.as_str()).unwrap());
-        req = req.header(hyper::header::COOKIE, jar.join("; "));
+        req = req.header(hyper::header::COOKIE, jar);
         if let Some(s) = ua {
             req = req.header(hyper::header::USER_AGENT, s);
         }
